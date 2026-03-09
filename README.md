@@ -49,6 +49,7 @@
 | `metadata_server.py` | ~80 | HTTP 元数据服务器 |
 | `example_disaggregated.py` | ~100 | 演示 Prefill/Decode 分离 |
 | `example_store.py` | ~90 | 演示 KVCache Store put/get |
+| `example_vllm_serving.py` | ~200 | vLLM 分离式推理 Proxy（对接真实 vLLM）|
 
 ## 核心概念
 
@@ -115,7 +116,65 @@ python example_store.py
 
 # 独立运行 Metadata Server
 python metadata_server.py --port 8080
+
+# 示例 3: vLLM + Mooncake 分离式推理 Proxy
+# 先启动 vLLM Prefill 和 Decode 实例，再启动 Proxy
+python example_vllm_serving.py \
+    --prefill-url http://PREFILL_HOST:8010 \
+    --decode-url http://DECODE_HOST:8020
 ```
+
+### vLLM 集成示例
+
+`example_vllm_serving.py` 是 Mooncake 的 [`vllm_v1_proxy_server.py`](https://kvcache-ai.github.io/Mooncake/performance/vllm-v1-support-benchmark.html) 的简化版，可以直接对接真实的 vLLM 实例：
+
+```
+┌────────┐       ┌───────────────────┐       ┌────────────────────────┐
+│ Client  │──────>│  Proxy (:8000)    │──────>│ vLLM Prefill (:8010)   │
+│         │       │  round-robin      │       │ --kv-role kv_producer   │
+│         │       │  routing          │       │ max_tokens=1            │
+│         │       │                   │       └────────┬───────────────┘
+│         │       │                   │                │ MooncakeConnector
+│         │       │                   │                │ (KVCache via RDMA)
+│         │       │                   │                ▼
+│         │<──────│                   │<───────┌───────┴───────────────┐
+│ (stream)│       │                   │ stream │ vLLM Decode (:8020)   │
+└────────┘       └───────────────────┘        │ --kv-role kv_consumer  │
+                                               └───────────────────────┘
+```
+
+**部署步骤（与 Mooncake benchmark 一致）：**
+
+```bash
+# Step 1: 启动 vLLM Prefill 实例 (kv_producer)
+vllm serve Qwen/Qwen3-8B \
+    --port 8010 \
+    --tensor-parallel-size 8 \
+    --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer"}' \
+    --disable-log-requests
+
+# Step 2: 启动 vLLM Decode 实例 (kv_consumer)
+vllm serve Qwen/Qwen3-8B \
+    --port 8020 \
+    --tensor-parallel-size 8 \
+    --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer"}' \
+    --disable-log-requests
+
+# Step 3: 启动 Proxy (本项目提供)
+python example_vllm_serving.py \
+    --prefill-url http://PREFILL_HOST:8010 \
+    --decode-url http://DECODE_HOST:8020
+
+# Step 4: 发送请求 (OpenAI 兼容 API)
+curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"Qwen/Qwen3-8B","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+Proxy 的核心逻辑：
+1. 将请求路由到 Prefill，注入 `kv_transfer_params{do_remote_decode=True}`，设 `max_tokens=1`
+2. Prefill 计算 KVCache，返回 `kv_transfer_params`（包含自身地址供 Decode 拉取）
+3. 将 `kv_transfer_params` 注入请求，路由到 Decode，流式返回生成结果
 
 ## 与原始 Mooncake 的对应关系
 
@@ -128,6 +187,7 @@ python metadata_server.py --port 8080
 | `StoreClient` | `mooncake-store/client/` | 无磁盘副本 |
 | `Replica` | `Replica`（3种类型） | 仅内存副本 |
 | `BumpAllocator` | CacheLib slab allocator | 线性分配 |
+| `DisaggregatedProxy` | `vllm_v1_proxy_server.py` | stdlib HTTP 实现 |
 | — | RDMA/NVLink/CXL Transport | 省略（只保留 TCP） |
 | — | 拓扑感知路由 | 省略 |
 | — | 多副本复制 + 条带化 | 省略 |
