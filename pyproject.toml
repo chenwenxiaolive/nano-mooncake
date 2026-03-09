@@ -1,0 +1,9 @@
+[project]
+name = "nano-mooncake"
+version = "0.1.0"
+description = "~500 lines of Python to understand Mooncake's core design"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.4.2",
+]
