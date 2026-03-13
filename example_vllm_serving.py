@@ -3,26 +3,35 @@ nano-mooncake: End-to-end vLLM Disaggregated Serving Demo
 ==========================================================
 Launches real vLLM instances and routes requests through the disaggregated proxy.
 
-Architecture (same as Mooncake vLLM v1 benchmark):
-  ┌────────┐       ┌───────────────────┐       ┌────────────────────────┐
-  │ Client  │──────>│  Proxy (:8000)    │──────>│ vLLM Prefill (:8010)   │
-  │         │       │                   │       │ max_tokens=1            │
-  │         │       │                   │       └────────────────────────┘
-  │         │       │                   │                │
-  │         │<──────│                   │<───────┌───────┴──────────────┐
-  │ (stream)│       │                   │ stream │ vLLM Decode (:8020)  │
-  └────────┘       └───────────────────┘        └──────────────────────┘
+Architecture:
+                    ┌─────────────────────┐
+                    │  Metadata Server    │
+                    │  (:8090)            │
+                    │  - segment registry │
+                    │  - KV location meta │
+                    └────┬──────────┬─────┘
+                    register    discover
+                    /store      /lookup
+                    ┌────┴───┐  ┌───┴────┐
+  ┌────────┐       │Prefill │  │Decode  │
+  │ Client  │──>   │(:8010) │  │(:8020) │
+  │         │      └───┬────┘  └───┬────┘
+  └────────┘           │  TCP TE   │
+       ↑               └───────────┘
+       │          direct data transfer
+       │
+  ┌────┴───┐
+  │ Proxy  │
+  │(:8000) │
+  └────────┘
 
-What this demo shows:
-  - Real vLLM instances serving a real LLM (Qwen2.5-0.5B-Instruct)
-  - Proxy routing: Prefill (compute KV, max_tokens=1) -> Decode (generate)
-  - OpenAI-compatible API throughout the pipeline
-
-Note: Without Mooncake's C++ Transfer Engine installed, KVCache is not
-actually transferred via RDMA/TCP between instances. The decode instance
-re-computes the prompt internally. The proxy routing logic and API flow
-are identical to a real Mooncake deployment — install mooncake and add
---kv-transfer-config to enable actual KV transfer.
+Flow:
+  1. Metadata server starts on :8090
+  2. Prefill starts → registers TE segment via HTTP → saves KV to TE buffer
+     → records KV location via HTTP
+  3. Decode starts → discovers Prefill's segment via HTTP → looks up KV location
+     via HTTP → reads data directly from Prefill's TE buffer via TCP
+  4. Proxy routes: Client → Prefill (max_tokens=1) → Decode (full generation)
 
 Requirements: pip install vllm (already installed via uv)
 """
@@ -47,8 +56,43 @@ MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PREFILL_PORT = 8010
 DECODE_PORT = 8020
 PROXY_PORT = 8000
+METADATA_PORT = 8090
+METADATA_URL = f"http://127.0.0.1:{METADATA_PORT}"
 # Split GPU memory between two instances
 GPU_MEMORY_UTIL = 0.45
+
+
+# ─────────────────────────────────────────────────────────────────
+# Metadata Server Launcher
+# ─────────────────────────────────────────────────────────────────
+
+def launch_metadata_server() -> subprocess.Popen:
+    """Launch the metadata server as a separate process."""
+    cmd = [
+        sys.executable, "metadata_server.py",
+        "--port", str(METADATA_PORT),
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    return proc
+
+
+def wait_for_metadata_server(url: str, timeout: int = 15) -> bool:
+    """Wait for metadata server to become ready."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            req = Request(f"{url}/health", method="GET")
+            with urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -56,7 +100,12 @@ GPU_MEMORY_UTIL = 0.45
 # ─────────────────────────────────────────────────────────────────
 
 def launch_vllm(role: str, port: int, gpu_memory_utilization: float) -> subprocess.Popen:
-    """Launch a vLLM serve process."""
+    """Launch a vLLM serve process with NanoMooncakeConnector."""
+    kv_config = json.dumps({
+        "kv_connector": "NanoMooncakeConnector",
+        "kv_connector_module_path": "nano_connector",
+        "kv_role": "kv_both",
+    })
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--model", MODEL,
@@ -64,9 +113,14 @@ def launch_vllm(role: str, port: int, gpu_memory_utilization: float) -> subproce
         "--gpu-memory-utilization", str(gpu_memory_utilization),
         "--max-model-len", "2048",
         "--no-enable-log-requests",
+        "--kv-transfer-config", kv_config,
     ]
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = "0"
+    # Point NanoMooncakeConnector to the centralized metadata server
+    env["NANO_METADATA_URL"] = METADATA_URL
+    # Ensure nano_connector.py is importable
+    env["PYTHONPATH"] = os.path.dirname(os.path.abspath(__file__)) + ":" + env.get("PYTHONPATH", "")
     proc = subprocess.Popen(
         cmd, env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -208,23 +262,38 @@ def send_test_request(prompt: str, max_tokens: int = 50) -> dict:
 def main():
     print("=" * 70)
     print("nano-mooncake: vLLM Disaggregated Serving Demo")
+    print("  with NanoMooncakeConnector (KV transfer via Transfer Engine)")
+    print("  Metadata server for cross-process coordination")
     print("=" * 70)
 
     processes = []
 
     try:
-        # ── Step 1: Launch vLLM Prefill instance ──
-        print(f"\n[1] Launching vLLM Prefill (:{PREFILL_PORT}, model={MODEL})...")
+        # ── Step 1: Launch Metadata Server ──
+        print(f"\n[1] Launching Metadata Server (:{METADATA_PORT})...")
+        meta_proc = launch_metadata_server()
+        processes.append(meta_proc)
+
+        if not wait_for_metadata_server(METADATA_URL):
+            print("    ERROR: Metadata server failed to start")
+            meta_proc.terminate()
+            out = meta_proc.stdout.read().decode()
+            print(out[-2000:])
+            return
+        print(f"    Metadata server ready at {METADATA_URL}")
+
+        # ── Step 2: Launch vLLM Prefill instance ──
+        print(f"\n[2] Launching vLLM Prefill (:{PREFILL_PORT}, model={MODEL})...")
         prefill_proc = launch_vllm("prefill", PREFILL_PORT, GPU_MEMORY_UTIL)
         processes.append(prefill_proc)
 
-        # ── Step 2: Launch vLLM Decode instance ──
-        print(f"[2] Launching vLLM Decode (:{DECODE_PORT}, model={MODEL})...")
+        # ── Step 3: Launch vLLM Decode instance ──
+        print(f"[3] Launching vLLM Decode (:{DECODE_PORT}, model={MODEL})...")
         decode_proc = launch_vllm("decode", DECODE_PORT, GPU_MEMORY_UTIL)
         processes.append(decode_proc)
 
-        # ── Step 3: Wait for servers to be ready ──
-        print("\n[3] Waiting for vLLM servers to initialize...")
+        # ── Step 4: Wait for servers to be ready ──
+        print("\n[4] Waiting for vLLM servers to initialize...")
         print("    (This may take 30-60 seconds for model loading)")
 
         if not wait_for_server(f"http://127.0.0.1:{PREFILL_PORT}"):
@@ -244,17 +313,18 @@ def main():
             return
         print(f"    Decode server ready at :{DECODE_PORT}")
 
-        # ── Step 4: Start Proxy ──
-        print(f"\n[4] Starting Proxy (:{PROXY_PORT})...")
+        # ── Step 5: Start Proxy ──
+        print(f"\n[5] Starting Proxy (:{PROXY_PORT})...")
         proxy_server = HTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
         proxy_thread = threading.Thread(target=proxy_server.serve_forever, daemon=True)
         proxy_thread.start()
         print(f"    Proxy ready at :{PROXY_PORT}")
 
-        # ── Step 5: Send test requests ──
+        # ── Step 6: Send test requests ──
         print("\n" + "=" * 70)
         print("Sending test requests through the disaggregated pipeline:")
         print("  Client -> Proxy(:8000) -> Prefill(:8010) -> Decode(:8020)")
+        print(f"  Metadata coordination via :{METADATA_PORT}")
         print("=" * 70)
 
         test_prompts = [
@@ -284,23 +354,23 @@ def main():
         print(f"\n{'=' * 70}")
         print("Demo complete! Architecture summary:")
         print()
-        print("  Current demo (without Mooncake C++ engine):")
-        print("    Proxy -> Prefill (max_tokens=1) -> Decode (full generation)")
-        print("    KVCache is re-computed by Decode (no transfer)")
+        print("  NanoMooncakeConnector (this demo):")
+        print("    - KV connector: nano_connector.NanoMooncakeConnector")
+        print("    - Data plane: nano-mooncake TCP Transfer Engine")
+        print(f"    - Control plane: HTTP metadata server (:{METADATA_PORT})")
+        print("    - Prefill saves KV: GPU -> CPU -> TE buffer -> HTTP metadata")
+        print("    - Decode loads KV: HTTP lookup -> TE READ -> CPU -> GPU")
         print()
-        print("  With Mooncake installed, add to vLLM launch:")
-        print(f'    --kv-transfer-config \'{{"kv_connector":"MooncakeConnector",')
-        print(f'      "kv_role":"kv_producer"}}\'   # for Prefill')
-        print(f'    --kv-transfer-config \'{{"kv_connector":"MooncakeConnector",')
-        print(f'      "kv_role":"kv_consumer"}}\'   # for Decode')
-        print()
-        print("  Then KVCache transfers via RDMA at 87+ GB/s!")
+        print("  Real Mooncake (production):")
+        print("    - KV connector: MooncakeConnector")
+        print("    - Data plane: RDMA at 87+ GB/s (GPU-direct)")
+        print("    - Control plane: ZMQ + etcd")
         print(f"{'=' * 70}")
 
         proxy_server.shutdown()
 
     finally:
-        # Clean up vLLM processes
+        # Clean up all processes (metadata server + vLLM instances)
         for proc in processes:
             proc.terminate()
             try:
