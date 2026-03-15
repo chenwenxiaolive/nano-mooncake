@@ -249,7 +249,10 @@ class NanoMooncakeConnector(KVConnectorBase_V1):
 
             # Extract KV from paged GPU memory
             kv_data = self._extract_kv(kv_layer, request.slot_mapping, attn_metadata)
-            kv_bytes = kv_data.detach().cpu().numpy().tobytes()
+            kv_cpu = kv_data.detach().cpu()
+            if kv_cpu.dtype == torch.bfloat16:
+                kv_cpu = kv_cpu.to(torch.float16)
+            kv_bytes = kv_cpu.numpy().tobytes()
 
             # Write to Transfer Engine buffer
             offset = self._allocate_buffer(len(kv_bytes))
@@ -342,10 +345,13 @@ class NanoMooncakeConnector(KVConnectorBase_V1):
                 # Reconstruct tensor and inject into GPU
                 kv_bytes = bytes(self._buffer[local_offset:local_offset + kv_size])
                 num_pages, page_size = kv_cache_layer.shape[1], kv_cache_layer.shape[2]
-                rest_dims = kv_cache_layer.shape[3:]
                 num_tokens = len(request.slot_mapping)
-                kv_tensor = torch.frombuffer(bytearray(kv_bytes), dtype=kv_cache_layer.dtype)
-                kv_tensor = kv_tensor.reshape(2, num_tokens, *rest_dims).cuda()
+                # Data was stored as float16 (numpy doesn't support bfloat16)
+                # _extract_kv flattens to [2, num_tokens, -1], so reshape the same way
+                wire_dtype = torch.float16 if kv_cache_layer.dtype == torch.bfloat16 else kv_cache_layer.dtype
+                kv_tensor = torch.frombuffer(bytearray(kv_bytes), dtype=wire_dtype)
+                kv_tensor = kv_tensor.reshape(2, num_tokens, -1)
+                kv_tensor = kv_tensor.to(dtype=kv_cache_layer.dtype).cuda()
 
                 # Inject into paged KV cache
                 flat = kv_cache_layer.reshape(2, num_pages * page_size, -1)

@@ -119,6 +119,7 @@ def launch_vllm(role: str, port: int, gpu_memory_utilization: float) -> subproce
     env["CUDA_VISIBLE_DEVICES"] = "0"
     # Point NanoMooncakeConnector to the centralized metadata server
     env["NANO_METADATA_URL"] = METADATA_URL
+    env["HF_HUB_OFFLINE"] = "1"
     # Ensure nano_connector.py is importable
     env["PYTHONPATH"] = os.path.dirname(os.path.abspath(__file__)) + ":" + env.get("PYTHONPATH", "")
     proc = subprocess.Popen(
@@ -178,20 +179,18 @@ def send_to_prefill(req_data: dict) -> dict:
         return json.loads(resp.read())
 
 
-def stream_from_decode(req_data: dict):
-    """Route to Decode and yield streaming chunks."""
+def send_to_decode(req_data: dict) -> dict:
+    """Route to Decode: full generation, non-streaming."""
+    decode_req = req_data.copy()
+    decode_req["stream"] = False
     url = decode_urls[next(decode_iter)]
     req = Request(
         f"{url}/v1/chat/completions",
-        data=json.dumps(req_data).encode(),
+        data=json.dumps(decode_req).encode(),
         headers={"Content-Type": "application/json"},
     )
     with urlopen(req, timeout=300) as resp:
-        while True:
-            chunk = resp.read(4096)
-            if not chunk:
-                break
-            yield chunk
+        return json.loads(resp.read())
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -219,16 +218,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if kv_transfer_params:
             decode_req["kv_transfer_params"] = kv_transfer_params
 
+        try:
+            decode_result = send_to_decode(decode_req)
+        except URLError as e:
+            self.send_error(502, f"Decode error: {e}")
+            return
+
+        response_body = json.dumps(decode_result).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response_body)))
         self.end_headers()
-
-        try:
-            for chunk in stream_from_decode(decode_req):
-                self.wfile.write(chunk)
-                self.wfile.flush()
-        except URLError:
-            pass
+        self.wfile.write(response_body)
 
     def log_message(self, format, *args):
         pass
